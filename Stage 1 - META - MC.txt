@@ -1,0 +1,375 @@
+import pandas as pd
+import numpy as np
+from pyspark.sql.functions import lit
+from pyspark.sql import SQLContext
+from pyspark.sql.session import SparkSession
+from pyspark.serializers import MarshalSerializer
+import traceback, time
+from datetime import datetime,date, timedelta
+from scipy import stats
+
+# Establishes connection with Spark
+def get_spark():
+    spark = SparkSession.builder.enableHiveSupport().appName("Mktg-Alerts-Backtesting-App").getOrCreate()
+    spark._jsc.hadoopConfiguration().set("fs.s3a.acl", "bucket-owner-full-control")
+    spark._jsc.hadoopConfiguration().set("fs.s3a.bucket.endpoint-detection.enable", "true")
+    return spark
+  
+# Pulls data using SQL code
+def get_data(sqlCode):
+    spark = get_spark()
+    df = spark.sql(sqlCode).toPandas()
+    return df
+
+# Algorithm - Simple Threshold. 
+# IF value >=/<= "X". Here "X" is the value entered in "min_delta_from_baseline" field   
+
+def alert_simple_threshold(df, counter, total_rows, direction, min_delta):
+    if direction=='INCREASED':
+        while True:
+            if(counter>=total_rows):                                                                   
+                break
+            if  df['metric_value'].iloc[counter] >= min_delta: 
+                df['alert_ind'].iloc[counter] = 1
+            counter=counter+1
+
+    if direction=='DECREASED':
+        while True:
+            if(counter>=total_rows):
+                break
+            if  df['metric_value'].iloc[counter] <= min_delta: 
+                df['alert_ind'].iloc[counter] = 1
+            counter=counter+1
+			
+    return df  
+
+# Algorithm - Category Change. 
+# IF value >=/<= "Value on previous day" +/- "X". Here "X" is the value entered in "min_delta_from_baseline" field. Note that string values have to be mapped as integer/decimal values
+
+def alert_category_change(df, counter, total_rows, direction, min_delta):
+    df['metric_value_lag'] = df['metric_value'].shift(1)
+	
+    if direction=='INCREASED':
+        while True:
+            if(counter>=total_rows):
+                break
+            if (counter>=1): 
+                if df['metric_value'].iloc[counter] >= df['metric_value_lag'].iloc[counter] + min_delta: 
+                    df['alert_ind'].iloc[counter] = 1
+            counter=counter+1
+
+    if direction=='DECREASED':
+        while True:
+            if(counter>=total_rows):
+                break
+            if (counter>=1): 
+                if  df['metric_value'].iloc[counter] <= df['metric_value_lag'].iloc[counter] - min_delta: 
+                    df['alert_ind'].iloc[counter] = 1
+            counter=counter+1
+			
+    return df  
+
+# Algorithm - Standard Deviation. 
+# Rule - IF value >=/<= Median +/- 2*SD  &  IF value >=/<= Median +/- "X" &  IF value>=/<= Median +/- (Median/10). This rule currently applies to 8D, 28D and L4Day_of_week time periods
+# Note: 1. Median used instead of average: to remove bias due to outlier
+#       2. Median +/- 2*SD: Checks for spikes and thus doesn't catch slowly increasing and decreasing trends
+#       3. Median +/- "X":  Checks if value is at least "X" away from the baseline (Median). Here "X" is the absolute value and is not in terms of percentage. This condition helps to minimize alerts for trends which have smaller SD
+#       4. Median +/- (Median/10): Checks if value is at least "X" away from the baseline (Median) where X is Median/10. It programatically assigns the delta from baseline based on size of the median. Ex: If Median of Clicks is 1000 then it should drop by atleast 100 in order to be alerted
+#       5. Note that since there is an "&" join between  (Median +/- "X") and (Median +/- (Median/10)), the greater of the 2 delta overrides the other one
+
+def alert_standard_deviation(df, counter, total_rows, direction, min_delta):
+    median_8D = 0 
+    median_28D = 0
+    std_8D = 0
+    std_28D = 0
+    current_value = 0
+
+    df['median8'] = df['metric_value'].rolling(8, min_periods=0).median().shift(1).fillna(0)
+    df['std8'] = df['metric_value'].rolling(8, min_periods=0).std(ddof=0).shift(1).fillna(0)
+    df['median28'] = df['metric_value'].rolling(28, min_periods=0).median().shift(1).fillna(0)
+    df['std28'] = df['metric_value'].rolling(28, min_periods=0).std(ddof=0).shift(1).fillna(0)
+
+    if direction=='INCREASED':		
+            while True:
+                if(counter>=total_rows):
+                    break
+                if (counter>=8): 
+                    median_8D = df['median8'].iloc[counter]
+                    std_8D = df['std8'].iloc[counter]
+                    current_value = df['metric_value'].iloc[counter]
+                    if (current_value >= median_8D + 2*std_8D) and (current_value >= median_8D + min_delta) and (current_value >= median_8D + (median_8D/10)):
+                        df['outlier8'].iloc[counter] = 1
+                if (counter>=28):
+                    median_28D = df['median28'].iloc[counter]
+                    std_28D = df['std28'].iloc[counter]
+                    current_value = df['metric_value'].iloc[counter]
+                    if (current_value >= median_28D + 2*std_28D) and (current_value >= median_28D + min_delta) and (current_value >= median_28D + (median_28D/10)):
+                        df['outlier28'].iloc[counter] = 1
+                counter=counter+1
+
+    if direction=='DECREASED':
+            while True:
+                if(counter>=total_rows):
+                    break
+                if (counter>=8): 
+                    median_8D = df['median8'].iloc[counter]
+                    std_8D = df['std8'].iloc[counter]
+                    current_value = df['metric_value'].iloc[counter]
+                    if median_8D>=0 and (current_value <= median_8D - 2*std_8D) and (current_value <= median_8D - min_delta) and (current_value <= median_8D - (median_8D/10)):
+                        df['outlier8'].iloc[counter] = 1
+                    if median_8D<0 and (current_value <= median_8D - 2*std_8D) and (current_value <= median_8D - min_delta) and (current_value <= median_8D - (-1*median_8D/10)):
+                        df['outlier8'].iloc[counter] = 1
+                if (counter>=28): 
+                    median_28D = df['median28'].iloc[counter]
+                    std_28D = df['std28'].iloc[counter]
+                    current_value = df['metric_value'].iloc[counter]
+                    if median_28D>=0 and (current_value <= median_28D - 2*std_28D) and (current_value <= median_28D - min_delta) and (current_value <= median_28D - (median_28D/10)):
+                        df['outlier28'].iloc[counter] = 1
+                    if median_28D<0 and (current_value <= median_28D - 2*std_28D) and (current_value <= median_28D - min_delta) and (current_value <= median_28D - (-1*median_28D/10)):
+                        df['outlier28'].iloc[counter] = 1
+                counter=counter+1
+			  
+    return df  
+
+def alert_standard_deviation_weekday(df, counter, total_rows, direction, min_delta):
+    median_4D = 0 
+    std_4D = 0
+    current_value = 0
+    counter=0
+
+    df['median4'] = df['metric_value'].rolling(4, min_periods=0).median().shift(1).fillna(0)
+    df['std4'] = df['metric_value'].rolling(4, min_periods=0).std(ddof=0).shift(1).fillna(0)
+
+    if direction=='INCREASED':		
+            while True:
+                if(counter>=total_rows):
+                    break
+                if(counter>=4):
+                    median_4D = df['median4'].iloc[counter]
+                    std_4D = df['std4'].iloc[counter]
+                    current_value = df['metric_value'].iloc[counter]
+                    outlier8 = df['outlier8'].iloc[counter]
+                    outlier28 = df['outlier28'].iloc[counter]
+                    if (current_value >= median_4D + 2*std_4D) and (current_value >= median_4D + min_delta) and (current_value >= median_4D + (median_4D/10)):
+                        df['outlier4'].iloc[counter] = 1
+                    if (current_value >= median_4D + 2*std_4D) and (current_value >= median_4D + min_delta) and (current_value >= median_4D + (median_4D/10)) and (outlier8==1 and outlier28==1):
+                        df['alert_ind'].iloc[counter] = 1
+                counter=counter+1
+
+    if direction=='DECREASED':
+            while True:
+                if(counter>=total_rows):
+                    break
+                if(counter>=4):
+                    median_4D = df['median4'].iloc[counter]
+                    std_4D = df['std4'].iloc[counter]
+                    current_value = df['metric_value'].iloc[counter]
+                    outlier8 = df['outlier8'].iloc[counter]
+                    outlier28 = df['outlier28'].iloc[counter]
+                    if median_4D>=0 and (current_value <= median_4D - 2*std_4D) and (current_value <= median_4D - min_delta) and (current_value <= median_4D - (median_4D/10)):
+                        df['outlier4'].iloc[counter] = 1
+                    if median_4D<0 and (current_value <= median_4D - 2*std_4D) and (current_value <= median_4D - min_delta) and (current_value <= median_4D - (-1*median_4D/10)):
+                        df['outlier4'].iloc[counter] = 1
+                    if median_4D>=0 and (current_value <= median_4D - 2*std_4D) and (current_value <= median_4D - min_delta) and (current_value <= median_4D - (median_4D/10)) and (outlier8==1 and outlier28==1):
+                        df['alert_ind'].iloc[counter] = 1
+                    if median_4D<0 and (current_value <= median_4D - 2*std_4D) and (current_value <= median_4D - min_delta) and (current_value <= median_4D - (-1*median_4D/10)) and (outlier8==1 and outlier28==1):
+                        df['alert_ind'].iloc[counter] = 1
+                counter=counter+1
+			  
+    return df  
+  
+# Main Function starts from here. Data is broken down into each granularity and alerts are calculated within them
+def update_alert_table(queryCode):
+    queryData = get_data(queryCode)
+    brand_list = queryData['brand'].unique()
+    algorithm_list = queryData['algorithm'].unique()
+    weekday_list =  queryData['weekday'].unique()
+    
+    frames =[]
+    t0 = time.time()
+    for brand in brand_list:
+        brand1 = queryData[(queryData.brand == brand)]
+        channel_list = brand1['channel'].unique()
+        for channel in channel_list:
+            channel1 = brand1[(brand1.channel == channel)]
+            lob_list = channel1['lob'].unique()
+            for lob in lob_list:
+                lob1 = channel1[(channel1.lob == lob)]	
+                partner_list = lob1['partner'].unique()
+                for partner in partner_list:
+                    partner1 = lob1[(lob1.partner == partner)]
+                    placement_list = partner1['placement_name'].unique()
+                    for placement in placement_list:
+                        placement1 = partner1[(partner1.placement_name == placement)]                        
+                        extra_key_1_list = placement1['extra_key_1'].unique()
+                        for extra_key_1 in extra_key_1_list:
+                            extra_key_11 = placement1[(placement1.extra_key_1 == extra_key_1)]
+                            extra_key_2_list = extra_key_11['extra_key_2'].unique()
+                            for extra_key_2 in extra_key_2_list:
+                                extra_key_21 = extra_key_11[(extra_key_11.extra_key_2 == extra_key_2)]
+                                extra_key_3_list = extra_key_21['extra_key_3'].unique()
+                                for extra_key_3 in extra_key_3_list:
+                                    extra_key_31 = extra_key_21[(extra_key_21.extra_key_3 == extra_key_3)]
+                                    pos_list = extra_key_31['pos'].unique()
+                                    for pos in pos_list:
+                                        df = extra_key_31[(extra_key_31.pos == pos)].sort_values(by=['file_date'])
+                                        df['median8']=0
+                                        df['std8']=0
+                                        df['outlier8'] = 0
+                                        df['median28']=0
+                                        df['std28']=0
+                                        df['outlier28'] = 0   
+                                        df['median4']=0
+                                        df['std4']=0
+                                        df['outlier4'] = 0                                                                    
+                                        df['alert_ind']=0 
+
+                                        counter=0
+                                        total_rows = df.shape[0] 
+                                        direction = df['direction'].unique()
+                                        min_delta = df['min_delta_from_baseline'].unique()
+
+                                        if(df.shape[0]>0):
+                                            if algorithm_list == 'STANDARD DEVIATION':
+                                                df = alert_standard_deviation(df, counter, total_rows, direction, min_delta)
+                                                                            
+                                                for weekday in weekday_list:
+                                                    weekday1 = df[(df.weekday == weekday)].sort_values(by=['file_date'])
+                                                    counter=0
+                                                    total_rows = weekday1.shape[0]
+                                                    df1 = alert_standard_deviation_weekday(weekday1, counter, total_rows, direction, min_delta)
+                                                    frames.append(df1)
+                                            if algorithm_list == 'CATEGORY CHANGE':
+                                                df = alert_category_change(df, counter, total_rows, direction, min_delta)
+                                                frames.append(df)
+                                            if algorithm_list == 'SIMPLE THRESHOLD':
+                                                df = alert_simple_threshold(df, counter, total_rows, direction, min_delta)
+                                                frames.append(df)
+    df_alert = pd.concat(frames)
+    df_alert['refresh_date_time'] = str(datetime.today().strftime ('%Y-%m-%d'))
+
+    # Update sem alert backtesting table
+    spark = get_spark()
+    output = spark.createDataFrame(df_alert)
+
+    # Reorder names
+    out2 = output.select('algorithm', 'direction', 'min_delta_from_baseline', 'correlated_alert_name_1', 'correlated_alert_name_2', 'category', 'sub_category', 'fire_alert_ind', 'informational_ind', 'user_name', 'email_id', 'slack_channel', 'summary', 'refresh_date_time',  'median8', 'std8', 'outlier8', 'median28', 'std28', 'outlier28', 'median4', 'std4', 'outlier4', 'weekday', 'file_date', 'metric_value', 'alert_ind', 'pos', 'placement_name', 'extra_key_1', 'extra_key_2', 'extra_key_3', 'brand', 'channel', 'lob', 'partner', 'alert_name' )
+    out2.registerTempTable("outputTableTest")
+
+    spark.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+    spark.sql("""
+        INSERT OVERWRITE TABLE project_meta_datascience.kg_mktg_alert_data PARTITION (brand, channel, lob, partner, alert_name) 
+        SELECT algorithm, direction, min_delta_from_baseline, correlated_alert_name_1, correlated_alert_name_2, category, sub_category, fire_alert_ind, informational_ind, user_name, email_id, slack_channel, summary, refresh_date_time,  median8, std8, outlier8, median28, std28, outlier28, median4, std4, outlier4, weekday, file_date, metric_value, alert_ind, pos, placement_name, extra_key_1, extra_key_2, extra_key_3, brand, channel, lob, partner, alert_name 
+        FROM outputTableTest
+    """)	
+
+queryCode = """
+	       SELECT partner_date as file_date,                                                                                       --[Ref 1]  Enter Date in String format
+	              FROM_UNIXTIME(UNIX_TIMESTAMP(partner_date,'yy-MM-dd'),'EEEE') AS weekday,                                        --[Ref 2]  Enter Date in String format
+                      UPPER('EXPEDIA') AS brand,                                                                                       --[Ref 3]  Reference field(Ex: brand) or harcode it(Ex: 'EXPEDIA' / 'ALL')
+                      UPPER('META') AS channel,                                                                                        --[Ref 4]  Similar to [Ref 3]
+                      UPPER(lob_intent) AS lob,                                                                                        --[Ref 5]  Similar to [Ref 3]
+                      UPPER(partner_org) AS partner,                                                                                   --[Ref 6]  Similar to [Ref 3]
+                      UPPER(pos) AS pos,                                                                                               --[Ref 7]  Similar to [Ref 3]
+                      placement_name,                                                                                                  --[Ref 8]  Similar to [Ref 3]
+                      COALESCE('NA') AS extra_key_1,                                                                                   --[Ref 9]  Can add additional Granularity here (EX: Match_type, Carrier, etc). Default 'NA'
+                      COALESCE('NA') AS extra_key_2,                                                                                   --[Ref 10] Similar to [Ref 9]
+                      UPPER('NA') AS extra_key_3,                                                                                      --[Ref 11] Similar to [Ref 9]
+                      UPPER('MC') AS alert_name,                                                                                       --[Ref 12] Hardcode it. Assign unique name at Brand, Channel, Lob, Partner Level else it can overwrite
+                      COALESCE(mc,0) AS metric_value,                                                                                  --[Ref 13] KPI/Alert value. If the values are strings, convert them into ordered numericals. Default 0
+                      UPPER('STANDARD DEVIATION') AS algorithm,                                                                        --[Ref 14] Options - STANDARD DEVIATION/ SIMPLE THRESHOLD/ CATEGORY CHANGE
+		      UPPER('DECREASED') AS direction,                                                                                 --[Ref 15] Options - INCREASED/DECREASED 
+		      CAST(1000 AS DOUBLE) AS min_delta_from_baseline,                                                                 --[Ref 16] Minimum change from median beyond which it is concerning. Default 0. More details below 
+                      UPPER('NA') AS correlated_alert_name_1,                                                                          --[Ref 17] Specify the performance KPIs - TRANSACTIONS, MC. Default 'NA'
+                      UPPER('NA') AS correlated_alert_name_2,                                                                          --[Ref 18] Specify a 2nd KPI for correlation. Default 'NA' 
+		      UPPER('ALL') AS category,                                                                                        --[Ref 19] Default 'ALL'. May be deprecated
+                      UPPER('ALL') AS sub_category,                                                                                    --[Ref 20] Default 'ALL'. May be deprecated
+		      UPPER('Y') AS fire_alert_ind,                                                                                    --[Ref 21] 'Y' = (Fire Alert), 'N' = (Do not fire alert). 'N' - use when setting up correlated KPI
+                      UPPER('N') AS informational_ind,                                                                                 --[Ref 22] 'Y' = (Non-actionable) 'N' = (Actionable)
+                      UPPER(username) AS user_name,                                                                                        --[Ref 23] Single User Alias
+                      ' ' AS email_id,                                                                                                 --[Ref 24] Seperate by commas. Default ' '
+		      ' ' AS slack_channel,                                                                                            --[Ref 25] Seperate by commas. Default ' '
+                      'file_date-alert_name-lob-partner-pos-placement_name' AS summary                                        --[Ref 26] Fields from above for Jira Summary. Avoid changing order of 1st few to maintain consistency
+               FROM
+                   (                                                              
+                                                                                                                                       -- [Ref 27] Code Start. User to enter their code in the area between Ref 27-28. More details below
+                    SELECT partner_date,
+                           partner_org,
+                           lob_intent,
+                           placement_name,
+                           pos,
+                           mc,
+                           CASE WHEN lob_intent='HOTEL' and partner_org='TRIVAGO' THEN 'asoflaei'
+                                WHEN lob_intent='HOTEL' and partner_org='GOOGLE' THEN 'aalberg'
+                                WHEN lob_intent='HOTEL' and partner_org='TRIPADVISOR' THEN 'rbhole'
+                                WHEN lob_intent='HOTEL' THEN 'ygoh'
+                                ELSE 'ygoh'
+                           END AS username
+                             
+                    FROM 
+                        (
+                         SELECT partner_date,
+                                partner_org,
+                                lob_intent,
+                                placement_name,
+                                pos1 as pos,
+                                mc,
+                                gp,
+                       	        cost,
+                                MAX(cost) OVER (PARTITION BY partner_org, lob_intent, pos1, placement_name) AS max_cost
+                         FROM
+                             (
+                              SELECT partner_date,
+                                     partner_org,
+                                     lob_intent,
+                                     placement_name,
+                                     CASE WHEN max_cost>=1000 or ((cost IS NULL or cost=0) and gp<=-1000) THEN partner_pos ELSE 'OTHERS' END as pos1,
+                                     SUM(mc) AS mc,
+                                     SUM(gp) AS gp,
+                        	     SUM(cost) AS cost
+	                      FROM 
+                                  (
+                                   SELECT a.*,
+                                          MAX(cost) OVER (PARTITION BY partner_org, lob_intent, partner_pos, placement_name) AS max_cost,
+	                                  SUM(cost) OVER (PARTITION BY partner_date, partner_org, lob_intent) AS sum_cost,
+	                                  SUM(gp) OVER (PARTITION BY partner_date, partner_org, lob_intent) AS sum_gp
+                                   FROM 
+                                       (
+                                        SELECT partner_date,
+                                               partner_org,
+                                               lob_intent,
+                                               partner_pos,
+                                               placement_name,
+                                               SUM(COALESCE(p_cost_usd,0)) AS cost,
+	                                       SUM(COALESCE(rlt_true_up_gp_usd,0)) AS gp,
+                                               SUM(COALESCE(rlt_true_up_gp_usd,0)-COALESCE(p_cost_usd,0)) AS mc
+                                        FROM sync.bid_unit_level_summary
+                                        WHERE data_source_key = 'META_DPS'
+	                                      AND marketing_brand = 'EXPEDIA'
+                                              AND partner_date >= DATE_SUB(CURRENT_DATE,60)
+                                              AND core_ind = 'Y'
+                                        GROUP BY 1,2,3,4,5
+	                               ) a
+                                  ) b
+                              WHERE (sum_gp<>0 and sum_cost<>0)
+                              GROUP BY 1,2,3,4,5
+                             ) 
+                         )
+                    WHERE max_cost>=1000 or ((cost IS NULL or cost=0) and gp<=-1000)
+                                                                                                                                       --[Ref 28] Code End
+                   ) xy
+						 
+
+"""
+
+update_alert_table(queryCode)
+
+
+# Ref 27 [User query] - Enter your query which pulls the data you need at the required granularity. Reference column names from here to the outer query
+# Ref 16 [Min_delta_from_baseline]- This is the minimum delta from your baseline above/below which you would want an alert to be fired. 
+#          Ex for Simple threshold- If you want to be alerted when bids are not released for >=3 days then minimum delta here is 3. 
+#          Ex for Category change- If you want to be alerted when the value becomes Good (4) from Excellent (Value 5) then minimum delta here is 1 
+#          Ex for Standard Deviation- If you want to be alerted when the Transactions drop by atleast 50 Transactions from Median, then minimum delta is 50. If you want alert to be fired when Unavailability increases by atleast 7 basis points (i.e. from 10% to >=17%), then minimum delta is 0.07
+# For setting up correlated alerts, you need to setup 2+ jobs. Ex: If you want to setup an alert for Unavailability correlated with Transactions, you need to setup 2 jobs 
+#         Job 1: Query = Transaction data at required granularity, Alert_Name='TRANSACTIONS' and correlated_alert_name_1 = 'NA' 
+#         Job 2: Query = Unavailability data at same granularity as Transactions, Alert_Name='UNAVAILABILITY' and correlated_alert_name_1= 'TRANSACTIONS'. Note: The correlated_alert_name_1's name has to match with alert_name from job 1

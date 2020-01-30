@@ -1,0 +1,50 @@
+SET hive.support.sql11.reserved.keywords=false;
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.parallel=true;
+SET hive.exec.compress.output = true;
+SET hive.auto.convert.join=false;
+SET hive.optimize.bucketmapjoin=true;
+SET hive.optimize.bucketmapjoin.sortedmerge=true;
+SET hive.vectorized.execution.enabled = true;
+SET hive.vectorized.execution.reduce.enabled = true;
+SET hive.cli.print.header=true;
+SET mapred.output.compression.codec = org.apache.hadoop.io.compress.GzipCodec;
+SET mapreduce.reduce.memory.mb=8000;
+SET fs.s3a.acl.default = BucketOwnerFullControl;
+
+USE project_meta_datascience;
+
+DROP TABLE IF EXISTS kg_mktg_alert_data_saved;
+CREATE TABLE kg_mktg_alert_data_saved
+    (
+     category STRING, 
+     sub_category  STRING,
+     brand  STRING,
+     channel  STRING,
+     lob  STRING, 
+     partner  STRING,
+     pos  STRING,
+     placement_name  STRING, 
+     extra_key_1  STRING,
+     extra_key_2 STRING,
+     extra_key_3 STRING,
+     alert_name STRING, 
+     file_date STRING,
+     external_flag STRING,
+     algorithm STRING, 
+     direction STRING,
+     user_name STRING,
+     informational_ind STRING,
+     email_id STRING,
+     slack_channel STRING,
+     summary STRING,
+     stage1_refresh_date_time STRING,
+     stage2_refresh_date_time STRING,
+     avg_difference DOUBLE,
+     avg_metric_value  DOUBLE,
+     avg_max_value DOUBLE,
+     correlated_alert_ind INT,
+     correlated_kpis STRING
+    );
+
+GRANT SELECT ON TABLE kg_mktg_alert_data_saved TO ROLE public;

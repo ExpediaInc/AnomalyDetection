@@ -1,0 +1,343 @@
+SELECT f.*,
+       CONCAT(CASE WHEN LOWER(summary) LIKE "%file_date%" THEN CONCAT(file_date, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%alert_name%" THEN CONCAT(alert_name, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%brand%" THEN CONCAT(brand, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%channel%" THEN CONCAT(channel, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%lob%" THEN CONCAT(lob, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%partner%" THEN CONCAT(partner, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%pos%" THEN CONCAT(pos1, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%placement_name%" THEN CONCAT(placement_name, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%extra_key_1%" THEN CONCAT(extra_key_1, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%extra_key_2%" THEN CONCAT(extra_key_2, " | ") ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%extra_key_3%" THEN CONCAT(extra_key_2, " | ") ELSE "" END) AS summary1,
+       COALESCE(CASE WHEN alert_name="TRANSACTION" AND external_flag=1 AND sum_difference BETWEEN -100 and 0 THEN 3
+	    WHEN alert_name="TRANSACTION" AND external_flag=1 and sum_difference BETWEEN -500 and -100 THEN 2
+	    WHEN alert_name="TRANSACTION" AND external_flag=1 and sum_difference<-500 THEN 1 
+	    WHEN alert_name="MC" AND external_flag=1 and sum_difference BETWEEN -2000 and 0 THEN 3
+	    WHEN alert_name="MC" AND external_flag=1 and sum_difference BETWEEN -5000 AND -2000 THEN 2
+	    WHEN alert_name="MC" AND external_flag=1 and sum_difference<5000 THEN 1
+       END,4) AS severity,
+       CONCAT(CASE WHEN LOWER(summary) LIKE "%placement_name%" THEN CONCAT(": ", placement_name) ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%extra_key_1%" THEN CONCAT(" :: ", extra_key_1) ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%extra_key_2%" THEN CONCAT(" ::: ", extra_key_2) ELSE "" END,
+              CASE WHEN LOWER(summary) LIKE "%extra_key_3%" THEN CONCAT(" :::: ", extra_key_3) ELSE "" END) AS level,
+       COALESCE(CASE WHEN external_flag=1 AND correlated_alert_ind=0 THEN 
+                                                                 CONCAT("Current Value: ",
+                                                                        sum_metric_value,
+                                                                        " | Median: ",
+                                                                        sum_max_value,
+                                                                        " | Difference: ",
+                                                                        sum_difference)
+            WHEN external_flag=1 AND correlated_alert_ind=1 THEN 
+                                                                 CONCAT("Current Value: ",
+                                                                        sum_metric_value,
+                                                                        " | Median: ",
+                                                                        sum_max_value,
+                                                                        " | Difference: ",
+                                                                        sum_difference,
+                                                                        " || Potential KPIs:",
+                                                                        correlated_kpis)
+       END,'NA') AS message
+FROM 
+    (
+     SELECT category, 
+            sub_category,
+            brand,
+            channel,
+            lob, 
+            partner,
+            placement_name, 
+            extra_key_1,
+            extra_key_2,
+            extra_key_3,
+            alert_name, 
+            file_date,
+            external_flag,
+            algorithm, 
+            direction,
+            user_name,
+            informational_ind,
+            email_id,
+            slack_channel,
+            summary,
+            correlated_kpis,
+            ROUND(SUM(avg_difference),2) as sum_difference,
+            ROUND(SUM(avg_metric_value),2) as sum_metric_value,
+            ROUND(SUM(avg_max_value),2) as sum_max_value,
+            MAX(correlated_alert_ind) as correlated_alert_ind,
+	    CONCAT_WS(" ",COLLECT_SET(pos)) AS pos1
+     FROM 
+         (
+          SELECT a.category, 
+                 a.sub_category,
+                 a.brand,
+                 a.channel,
+                 a.lob, 
+                 a.partner,
+                 a.pos,
+                 a.placement_name, 
+                 a.extra_key_1,
+                 a.extra_key_2,
+                 a.extra_key_3,
+                 a.alert_name, 
+                 a.file_date,
+             	 a.alert_ind as external_flag,
+                 a.algorithm, 
+                 a.direction,
+                 a.user_name,
+                 a.informational_ind,
+                 a.email_id,
+                 a.slack_channel,
+                 a.summary,
+                 AVG(a.metric_value-a.max_value) as avg_difference,
+                 AVG(a.metric_value) as avg_metric_value,
+                 AVG(a.max_value) as avg_max_value,
+                 MAX(CASE WHEN a.alert_ind=1 and b.alert_ind_1=1 THEN 1 ELSE 0 END) as correlated_alert_ind,
+	         CONCAT_WS(", ",COLLECT_SET(b.alert_name)) AS correlated_kpis
+          FROM 
+              (
+               SELECT category,
+                      sub_category,
+	              brand,
+                      channel,
+                      lob, 
+                      partner,
+                      placement_name,
+                      pos,
+                      extra_key_1,
+                      extra_key_2,
+                      extra_key_3,
+                      alert_name, 
+                      file_date,
+	              alert_ind,
+                      algorithm,
+	              direction,
+                      user_name,
+                      informational_ind,
+                      email_id,
+                      slack_channel,
+                      summary,
+                      metric_value,
+                      CASE WHEN median4<0 or median8<0 or median28<0 THEN LEAST(median8, median28, median4)
+                           ELSE GREATEST(median8, median28, median4)
+		      END as max_value
+               FROM project_meta_datascience.kg_mktg_alert_data
+               WHERE fire_alert_ind="Y" 
+                     AND file_date>=DATE_SUB(CURRENT_DATE,8)
+               GROUP BY category,
+                        sub_category,
+	                brand,
+                        channel,
+                        lob, 
+                        partner,
+                        placement_name,
+                        pos,
+                        extra_key_1,
+                        extra_key_2,
+                        extra_key_3,
+                        alert_name, 
+                        file_date,
+	                alert_ind,
+                        algorithm,
+	                direction,
+                        user_name,
+                        informational_ind,
+                        email_id,
+                        slack_channel,
+                        summary,
+                        metric_value,
+                        CASE WHEN median4<0 or median8<0 or median28<0 THEN LEAST(median8, median28, median4)
+                             ELSE GREATEST(median8, median28, median4)
+		        END
+              )  a  
+          LEFT JOIN 
+              (
+               SELECT a.*, 
+                      MAX(alert_ind) OVER (PARTITION BY brand, channel, lob, partner, placement_name, pos, extra_key_1, extra_key_2, extra_key_3, alert_name, correlated_alert_name_1 ORDER BY file_date ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS alert_ind_1
+               FROM 
+                   (
+                    SELECT brand,
+                           channel,
+                           lob, 
+                           partner,
+                           placement_name,
+                           pos,
+                           extra_key_1,
+                           extra_key_2,
+                           extra_key_3,
+                           alert_name, 
+                           file_date,
+	                   alert_ind,
+                           correlated_alert_name_1
+                    FROM project_meta_datascience.kg_mktg_alert_data
+                    WHERE file_date>=DATE_SUB(CURRENT_DATE,8)
+                          AND fire_alert_ind="N" 
+			  AND correlated_alert_name_1 <> "NA"
+                          AND alert_ind=1
+                    GROUP BY brand,
+                             channel,
+                             lob, 
+                             partner,
+                             placement_name,
+                             pos,
+                             extra_key_1,
+                             extra_key_2,
+                             extra_key_3,
+                             alert_name, 
+                             file_date,
+	                     alert_ind,
+                             correlated_alert_name_1
+                   ) a
+              )  b
+          ON a.brand=b.brand
+             AND a.channel=b.channel
+             AND a.lob=b.lob
+             AND a.partner=b.partner
+             AND a.placement_name=b.placement_name
+             AND a.pos=b.pos
+             AND a.extra_key_1=b.extra_key_1
+             AND a.extra_key_2=b.extra_key_2
+             AND a.extra_key_3=b.extra_key_3
+             AND a.file_date=b.file_date
+             AND a.alert_name=b.correlated_alert_name_1
+          LEFT JOIN 
+              (
+               SELECT brand,
+                      channel,
+                      lob, 
+                      partner,
+                      placement_name,
+                      pos,
+                      extra_key_1,
+                      extra_key_2,
+                      extra_key_3,
+                      alert_name,
+                      file_date, 
+                      MAX(external_flag) as alert_flag
+               FROM project_meta_datascience.kg_mktg_alert_data_saved
+               WHERE file_date>= DATE_SUB(CURRENT_DATE,8)
+               GROUP BY brand,
+                        channel,
+                        lob, 
+                        partner,
+                        placement_name,
+                        pos,
+                        extra_key_1,
+                        extra_key_2,
+                        extra_key_3,
+                        alert_name,
+                        file_date
+              ) c
+          ON a.brand=c.brand
+             AND a.channel=c.channel
+             AND a.lob=c.lob
+             AND a.partner=c.partner
+             AND a.placement_name=c.placement_name 
+             AND a.pos=c.pos
+             AND a.extra_key_1=c.extra_key_1
+             AND a.extra_key_2=c.extra_key_2
+             AND a.extra_key_3=c.extra_key_3
+             AND a.file_date=c.file_date
+             AND a.alert_name=c.alert_name
+          LEFT JOIN 
+              (
+               SELECT c.* 
+               FROM
+                   (
+                    SELECT b.*,
+                           RANK() OVER (PARTITION BY brand, channel, lob, partner, placement_name, pos1, extra_key_1, extra_key_2, extra_key_3, alert ORDER BY live_date DESC) as rows1
+                    FROM 
+                        (
+                         SELECT a.brand,
+                                a.channel,
+                                a.lob, 
+                                a.partner,
+                                COALESCE(TRIM(SPLIT(SPLIT(a.level,':')[1],'::')[0]),'ALL') AS placement_name,
+                                exp.pos1,
+                                COALESCE(TRIM(SPLIT(SPLIT(a.level,'::')[1],':::')[0]), 'NA') AS extra_key_1,
+                                COALESCE(TRIM(SPLIT(SPLIT(a.level,':::')[1],'::::')[0]), 'NA') AS extra_key_2,
+                                COALESCE(TRIM(SPLIT(a.level,'::::')[1]), 'NA') AS extra_key_3,
+                                a.alert,
+                                a.live_date
+                         FROM 
+                             (
+                              SELECT brand,
+                                     channel,
+                                     lob, 
+                                     partner,
+                                     level,
+                                     pos,
+                                     alert,
+                                     live_date
+                              FROM project_meta_datascience.rb_jira_meta_alerts 
+                              WHERE status <> 'Done' 
+                              GROUP BY  brand,
+                                        channel,
+                                        lob, 
+                                        partner,
+                                        level,
+                                        pos,
+                                        alert,
+                                        live_date
+                             )a
+                         LATERAL VIEW EXPLODE(SPLIT(pos,'\\s')) exp AS pos1
+                        ) b
+                   )c
+               WHERE rows1=1
+              ) d
+          ON a.brand=d.brand
+             AND a.channel=d.channel
+             AND a.lob=d.lob
+             AND a.partner=d.partner
+             AND a.placement_name=d.placement_name 
+             AND a.pos=d.pos1
+             AND a.extra_key_1=d.extra_key_1
+             AND a.extra_key_2=d.extra_key_2
+             AND a.extra_key_3=d.extra_key_3
+             AND a.alert_name=d.alert
+          WHERE (c.alert_flag IS NULL OR c.alert_flag=0) AND d.alert IS NULL
+          GROUP BY a.category, 
+                   a.sub_category,
+                   a.brand,
+                   a.channel,
+                   a.lob, 
+                   a.partner,
+                   a.pos,
+                   a.placement_name, 
+                   a.extra_key_1,
+                   a.extra_key_2,
+                   a.extra_key_3,
+                   a.alert_name, 
+                   a.file_date,
+             	   a.alert_ind,
+                   a.algorithm, 
+                   a.direction,
+                   a.user_name,
+                   a.informational_ind,
+                   a.email_id,
+                   a.slack_channel,
+                   a.summary
+          ORDER BY alert_name, pos ASC
+         ) e
+     GROUP BY category, 
+              sub_category,
+              brand,
+              channel,
+              lob, 
+              partner,
+              placement_name, 
+              extra_key_1,
+              extra_key_2,
+              extra_key_3,
+              alert_name, 
+              file_date,
+              external_flag,
+              algorithm, 
+              direction,
+              user_name,
+              informational_ind,
+              email_id,
+              slack_channel,
+              summary,
+              correlated_kpis
+     ) f
